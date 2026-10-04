@@ -3,94 +3,131 @@ const app = express();
 
 const PORT = process.env.PORT || 3000;
 
-// Servidor Web para manter o Render ativo 24/7
-app.get('/', (req, res) => res.send('🤖 Bot IMVU Ativo com Sistema de Votação e Música!'));
-app.listen(PORT, () => console.log(`[HTTP] Servidor rodando na porta ${PORT}`));
+// Web server para manter o serviço no ar no Render
+app.get('/', (req, res) => res.send('🤖 Bot IMVU Conectado e Ativo na Sala!'));
+app.listen(PORT, () => console.log(`[HTTP] Servidor a rodar na porta ${PORT}`));
 
-// Configurações
+// Tentar carregar a biblioteca de cliente IMVU se instalada
+let IMVU;
+try {
+  IMVU = require('imvu.js');
+} catch (e) {
+  console.log('[AVISO] Módulo imvu.js não encontrado, a rodar em modo de simulação.');
+}
+
+// Credenciais vindas das variáveis de ambiente do Render
 const CONFIG = {
-  usuarioBot: process.env.IMVU_USER,
-  senhaBot: process.env.IMVU_PASS,
-  idSala: process.env.IMVU_ROOM_ID
+  user: process.env.IMVU_USER,
+  pass: process.env.IMVU_PASS,
+  roomId: process.env.IMVU_ROOM_ID
 };
 
-// Controle do Estado da Votação
 let votacaoAtiva = false;
 let alvoVotacao = '';
 let votosSim = 0;
 let votosNao = 0;
 let usuariosQueVotaram = new Set();
-let tempoVotacaoTimer = null;
+let timerVotacao = null;
 
-// Função para processar os comandos do chat
-function processarMensagemChat(autor, mensagem) {
-  const msgLimpa = mensagem.trim();
-
-  // 1. Comando de Música: MSC/ nome da música
-  if (msgLimpa.toUpperCase().startsWith('MSC/')) {
-    const nomeMusica = msgLimpa.substring(4).trim();
-    if (!nomeMusica) {
-      console.log(`[CHAT] ${autor}: Por favor, informe o nome da música após MSC/`);
-      return;
-    }
-    console.log(`[MÚSICA] Tocando/pesquisando música: "${nomeMusica}" solicitada por ${autor}`);
+async function iniciarBotIMVU() {
+  if (!CONFIG.user || !CONFIG.pass) {
+    console.error('[ERRO] Preencha IMVU_USER e IMVU_PASS nas variáveis do Render!');
     return;
   }
 
-  // 2. Comando para Iniciar Votação de Expulsão: !kick @usuario
-  if (msgLimpa.toLowerCase().startsWith('!kick ')) {
-    if (votacaoAtiva) {
-      console.log(`[VOTAÇÃO] Já existe uma votação em andamento contra ${alvoVotacao}!`);
-      return;
-    }
+  console.log(`[IMVU] A autenticar conta do bot: ${CONFIG.user}...`);
 
-    alvoVotacao = msgLimpa.split(' ')[1];
+  if (IMVU) {
+    try {
+      const client = new IMVU.Client();
+      await client.login(CONFIG.user, CONFIG.pass);
+      console.log('[IMVU] Login efetuado com sucesso!');
+
+      if (CONFIG.roomId) {
+        const room = await client.joinRoom(CONFIG.roomId);
+        console.log(`[IMVU] Avatar entrou na sala ID: ${CONFIG.roomId}`);
+
+        room.on('message', (msg) => {
+          processarComandosChat(room, msg.author, msg.text);
+        });
+      }
+    } catch (err) {
+      console.error('[ERRO IMVU] Falha ao conectar à sala do IMVU:', err.message);
+    }
+  } else {
+    console.log('[IMVU] Bot pronto na nuvem! Adicione package imvu.js para sincronizar avatar.');
+  }
+}
+
+function processarComandosChat(room, autor, mensagem) {
+  const texto = mensagem.trim();
+
+  // 1. Comando de Música: MSC/ nome da música
+  if (texto.toUpperCase().startsWith('MSC/')) {
+    const musica = texto.substring(4).trim();
+    if (!musica) return;
+    console.log(`[MÚSICA] ${autor} pediu a música: ${musica}`);
+    if (room && room.send) {
+      room.send(`🎵 A tocar a música pedida por ${autor}: ${musica}`);
+    }
+    return;
+  }
+
+  // 2. Comando !kick @usuario
+  if (texto.toLowerCase().startsWith('!kick ')) {
+    if (votacaoAtiva) return;
+
+    alvoVotacao = texto.split(' ')[1];
     votacaoAtiva = true;
     votosSim = 0;
     votosNao = 0;
     usuariosQueVotaram.clear();
 
-    console.log(`[VOTAÇÃO] ⚠️ Votação para expulsar ${alvoVotacao} iniciada por ${autor}!`);
-    console.log(`[VOTAÇÃO] Responda no chat com 'S' para SIM ou 'N' para NÃO. Tempo limite: 30 segundos.`);
+    const aviso = `⚠️ Votação para expulsar ${alvoVotacao}! Digite 'S' para SIM ou 'N' para NÃO. (Tempo: 30s)`;
+    console.log(`[VOTAÇÃO] ${aviso}`);
+    if (room && room.send) room.send(aviso);
 
-    tempoVotacaoTimer = setTimeout(() => {
-      finalizarVotacao();
+    timerVotacao = setTimeout(() => {
+      encerrarVotacao(room);
     }, 30000);
 
     return;
   }
 
-  // 3. Registro de Votos (S ou N)
+  // 3. Registo dos Votos (S ou N)
   if (votacaoAtiva) {
-    const voto = msgLimpa.toUpperCase();
+    const voto = texto.toUpperCase();
     if (voto === 'S' || voto === 'N') {
       if (usuariosQueVotaram.has(autor)) return;
 
       usuariosQueVotaram.add(autor);
-
       if (voto === 'S') votosSim++;
       if (voto === 'N') votosNao++;
 
-      console.log(`[VOTAÇÃO] ${autor} votou (${voto}). Placar atual: S: ${votosSim} | N: ${votosNao}`);
+      console.log(`[VOTO] ${autor} votou ${voto}. Placar: S:${votosSim} | N:${votosNao}`);
 
       if (votosSim >= 3) {
-        clearTimeout(tempoVotacaoTimer);
-        finalizarVotacao();
+        clearTimeout(timerVotacao);
+        encerrarVotacao(room);
       }
     }
   }
 }
 
-// Finalizar Votação
-function finalizarVotacao() {
+function encerrarVotacao(room) {
   if (!votacaoAtiva) return;
 
-  console.log(`[VOTAÇÃO] Votação encerrada! Resultado final - SIM: ${votosSim} | NÃO: ${votosNao}`);
-
   if (votosSim > votosNao && votosSim >= 2) {
-    console.log(`[BOOT] 👢 O usuário ${alvoVotacao} foi expulso da sala por votação!`);
+    const msgBoot = `👢 Votação encerrada! O utilizador ${alvoVotacao} foi expulso.`;
+    console.log(`[BOOT] ${msgBoot}`);
+    if (room && room.send) {
+      room.send(msgBoot);
+      if (room.kick) room.kick(alvoVotacao);
+    }
   } else {
-    console.log(`[VOTAÇÃO] A votação falhou. ${alvoVotacao} continua na sala.`);
+    const msgFalha = `❌ Votação encerrada! ${alvoVotacao} continua na sala.`;
+    console.log(`[VOTAÇÃO] ${msgFalha}`);
+    if (room && room.send) room.send(msgFalha);
   }
 
   votacaoAtiva = false;
@@ -98,8 +135,4 @@ function finalizarVotacao() {
   usuariosQueVotaram.clear();
 }
 
-async function iniciarBot() {
-  console.log('[IMVU] Módulo de comandos de música e votação carregados com sucesso.');
-}
-
-iniciarBot();
+iniciarBotIMVU();
