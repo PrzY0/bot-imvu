@@ -1,1 +1,13 @@
-
+{
+  "name": "bot-imvu",
+  "version": "1.0.0",
+  "description": "Bot IMVU",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "imvu.js": "^1.0.0"
+  }
+}
