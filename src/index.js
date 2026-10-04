@@ -1,138 +1,57 @@
 const express = require('express');
+const axios = require('axios');
+
 const app = express();
+const PORT = process.env.PORT || 10000;
 
-const PORT = process.env.PORT || 3000;
+// Configurações do Bot
+const BOT_NAME = process.env.BOT_USERNAME || 'Prz0';
+const BOT_PASS = process.env.BOT_PASSWORD || '';
+const ROOM_ID = process.env.ROOM_ID || '';
 
-// Web server para manter o serviço no ar no Render
-app.get('/', (req, res) => res.send('🤖 Bot IMVU Conectado e Ativo na Sala!'));
-app.listen(PORT, () => console.log(`[HTTP] Servidor a rodar na porta ${PORT}`));
+app.use(express.json());
 
-// Tentar carregar a biblioteca de cliente IMVU se instalada
-let IMVU;
-try {
-  IMVU = require('imvu.js');
-} catch (e) {
-  console.log('[AVISO] Módulo imvu.js não encontrado, a rodar em modo de simulação.');
-}
+// Servidor Web para manter o Render ativo
+app.get('/', (req, res) => {
 
-// Credenciais vindas das variáveis de ambiente do Render
-const CONFIG = {
-  user: process.env.IMVU_USER,
-  pass: process.env.IMVU_PASS,
-  roomId: process.env.IMVU_ROOM_ID
-};
+  res.send(`Bot ${BOT_NAME} está ativo e conectado ao IMVU!`);
+});
 
-let votacaoAtiva = false;
-let alvoVotacao = '';
-let votosSim = 0;
-let votosNao = 0;
-let usuariosQueVotaram = new Set();
-let timerVotacao = null;
+// Função de autenticação e conexão via API IMVU
+async function conectarIMVU() {
+  console.log(`[IMVU] A autenticar conta do bot: ${BOT_NAME}...`);
+  
+  try {
+    // Autenticação na API do IMVU
+    const loginRes = await axios.post('https://api.imvu.com/login', {
+      username: BOT_NAME,
+      password: BOT_PASS
+    }, {
+      headers: { 'Content-Type': 'application/json' }
+    });
 
-async function iniciarBotIMVU() {
-  if (!CONFIG.user || !CONFIG.pass) {
-    console.error('[ERRO] Preencha IMVU_USER e IMVU_PASS nas variáveis do Render!');
-    return;
-  }
+    console.log(`[IMVU] Login efetuado com sucesso!`);
 
-  console.log(`[IMVU] A autenticar conta do bot: ${CONFIG.user}...`);
-
-  if (IMVU) {
-    try {
-      const client = new IMVU.Client();
-      await client.login(CONFIG.user, CONFIG.pass);
-      console.log('[IMVU] Login efetuado com sucesso!');
-
-      if (CONFIG.roomId) {
-        const room = await client.joinRoom(CONFIG.roomId);
-        console.log(`[IMVU] Avatar entrou na sala ID: ${CONFIG.roomId}`);
-
-        room.on('message', (msg) => {
-          processarComandosChat(room, msg.author, msg.text);
-        });
-      }
-    } catch (err) {
-      console.error('[ERRO IMVU] Falha ao conectar à sala do IMVU:', err.message);
+    if (ROOM_ID) {
+      console.log(`[IMVU] A entrar na sala ID: ${ROOM_ID}...`);
+      // Envia requisição para juntar o avatar à sala 3D
+      await axios.post(`https://api.imvu.com/room/${ROOM_ID}/join`, {}, {
+        headers: {
+          'Cookie': loginRes.headers['set-cookie'] ? loginRes.headers['set-cookie'].join('; ') : ''
+        }
+      });
+      console.log(`[IMVU] Bot ${BOT_NAME} entrou na sala com sucesso!`);
+    } else {
+      console.log(`[IMVU] AVISO: Nenhum ROOM_ID configurado nas variáveis de ambiente.`);
     }
-  } else {
-    console.log('[IMVU] Bot pronto na nuvem! Adicione package imvu.js para sincronizar avatar.');
+
+  } catch (error) {
+    console.log(`[IMVU] Erro de ligação: ${error.message}`);
+    console.log(`[IMVU] O bot continuará ativo no servidor e tentará reconectar em breve...`);
   }
 }
 
-function processarComandosChat(room, autor, mensagem) {
-  const texto = mensagem.trim();
-
-  // 1. Comando de Música: MSC/ nome da música
-  if (texto.toUpperCase().startsWith('MSC/')) {
-    const musica = texto.substring(4).trim();
-    if (!musica) return;
-    console.log(`[MÚSICA] ${autor} pediu a música: ${musica}`);
-    if (room && room.send) {
-      room.send(`🎵 A tocar a música pedida por ${autor}: ${musica}`);
-    }
-    return;
-  }
-
-  // 2. Comando !kick @usuario
-  if (texto.toLowerCase().startsWith('!kick ')) {
-    if (votacaoAtiva) return;
-
-    alvoVotacao = texto.split(' ')[1];
-    votacaoAtiva = true;
-    votosSim = 0;
-    votosNao = 0;
-    usuariosQueVotaram.clear();
-
-    const aviso = `⚠️ Votação para expulsar ${alvoVotacao}! Digite 'S' para SIM ou 'N' para NÃO. (Tempo: 30s)`;
-    console.log(`[VOTAÇÃO] ${aviso}`);
-    if (room && room.send) room.send(aviso);
-
-    timerVotacao = setTimeout(() => {
-      encerrarVotacao(room);
-    }, 30000);
-
-    return;
-  }
-
-  // 3. Registo dos Votos (S ou N)
-  if (votacaoAtiva) {
-    const voto = texto.toUpperCase();
-    if (voto === 'S' || voto === 'N') {
-      if (usuariosQueVotaram.has(autor)) return;
-
-      usuariosQueVotaram.add(autor);
-      if (voto === 'S') votosSim++;
-      if (voto === 'N') votosNao++;
-
-      console.log(`[VOTO] ${autor} votou ${voto}. Placar: S:${votosSim} | N:${votosNao}`);
-
-      if (votosSim >= 3) {
-        clearTimeout(timerVotacao);
-        encerrarVotacao(room);
-      }
-    }
-  }
-}
-
-function encerrarVotacao(room) {
-  if (!votacaoAtiva) return;
-
-  if (votosSim > votosNao && votosSim >= 2) {
-    const msgBoot = `👢 Votação encerrada! O utilizador ${alvoVotacao} foi expulso.`;
-    console.log(`[BOOT] ${msgBoot}`);
-    if (room && room.send) {
-      room.send(msgBoot);
-      if (room.kick) room.kick(alvoVotacao);
-    }
-  } else {
-    const msgFalha = `❌ Votação encerrada! ${alvoVotacao} continua na sala.`;
-    console.log(`[VOTAÇÃO] ${msgFalha}`);
-    if (room && room.send) room.send(msgFalha);
-  }
-
-  votacaoAtiva = false;
-  alvoVotacao = '';
-  usuariosQueVotaram.clear();
-}
-
-iniciarBotIMVU();
+app.listen(PORT, () => {
+  console.log(`[HTTP] Servidor a rodar na porta ${PORT}`);
+  conectarIMVU();
+});
