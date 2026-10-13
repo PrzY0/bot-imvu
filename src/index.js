@@ -81,6 +81,11 @@ const COOLDOWN_BANIR_PESSOA_MS = 10 * 1000;      // a mesma pessoa não pode fic
 const COOLDOWN_AJUDA_MS = 60 * 1000;             // !ajuda só aparece 1 vez por minuto
 const COOLDOWN_PIADA_MS = 30 * 1000;
 const COOLDOWN_IA_PESSOA_MS = 8 * 1000;          // a mesma pessoa só ativa a IA de novo depois de 8s (evita gasto e spam)
+// Limpeza do chat: a cada X minutos o bot apaga da PÁGINA as mensagens antigas e mantém só as mais recentes
+// (o chat do IMVU só cresce e deixa o navegador pesado). 0 = desligado. Pode trocar com as variáveis LIMPAR_CHAT_MIN e MANTER_LINHAS_CHAT.
+const LIMPAR_CHAT_MIN = Number(process.env.LIMPAR_CHAT_MIN ?? 30);
+const LIMPAR_CHAT_MS = LIMPAR_CHAT_MIN * 60 * 1000;
+const MANTER_LINHAS_CHAT = Math.max(30, Number(process.env.MANTER_LINHAS_CHAT) || 150); // linhas recentes que ficam (o ban precisa achar a última mensagem da pessoa)
 const COOLDOWN_MUSICA_MS = 20 * 1000;            // intervalo entre comandos de música para pessoas comuns (PrzY e moderadores não têm limite)
 const MEMORIA_IA_MS = 2 * 60 * 1000;             // cada pessoa tem a sua conversa; se ela ficar 2 min sem escrever, o histórico é apagado
 const MAX_TROCAS_IA = 6;                         // e das últimas 6 trocas
@@ -405,8 +410,13 @@ async function iniciarBot() {
         '--no-sandbox',
         '--disable-setuid-sandbox'
     ];
+    // Tamanho da "tela" na nuvem (padrão 1366x768; pode trocar com VIEWPORT=1280x720 se ficar pesado).
+    const [vpL, vpA] = (process.env.VIEWPORT || '1366x768').split('x').map(n => parseInt(n, 10) || 0);
+    const viewportNuvem = { width: vpL || 1366, height: vpA || 768 };
+    // Servidor não tem placa de vídeo: o 3D da sala é desenhado pelo processador (SwiftShader). Para desligar: GL_SOFTWARE=0.
+    const argsGL = process.env.GL_SOFTWARE === '0' ? [] : ['--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--ignore-gpu-blocklist'];
     const argsNavegador = isNuvem
-        ? [...argsBase, '--window-size=1366,768', '--disable-dev-shm-usage']
+        ? [...argsBase, `--window-size=${viewportNuvem.width},${viewportNuvem.height}`, '--disable-dev-shm-usage', ...argsGL]
         : ['--start-maximized', ...argsBase];
     console.log(isNuvem ? '☁️ Modo NUVEM (sem janela)' : '💻 Modo LOCAL (janela visível)');
 
@@ -414,7 +424,7 @@ async function iniciarBot() {
         headless: isNuvem,
         executablePath,
         userDataDir: path.resolve(process.env.DADOS_BOT_DIR || './dados_bot'),
-        defaultViewport: isNuvem ? { width: 1366, height: 768 } : null,
+        defaultViewport: isNuvem ? viewportNuvem : null,
         ignoreDefaultArgs: ['--enable-automation'],
         args: argsNavegador
     });
@@ -424,6 +434,32 @@ async function iniciarBot() {
     const page = (await browser.pages())[0];
     page.setDefaultNavigationTimeout(0);
     page.setDefaultTimeout(0);
+
+    // ---------- NUVEM: login por cookies + identidade normal de navegador ----------
+    // No servidor a pasta dados_bot do Windows NÃO serve (o Chrome criptografa os cookies com a chave do Windows).
+    // Por isso: rode "node exportar-cookies.js" no seu PC e suba o arquivo cookies-imvu.json para o servidor.
+    if (isNuvem || process.env.USAR_COOKIES === '1') {
+        try {
+            const ua = (await browser.userAgent()).replace('HeadlessChrome', 'Chrome');
+            await page.setUserAgent(ua);
+        } catch (e) { console.log(`⚠️ user-agent: ${e.message}`); }
+        try {
+            if (fs.existsSync('cookies-imvu.json')) {
+                const brutos = JSON.parse(fs.readFileSync('cookies-imvu.json', 'utf8'));
+                const cookies = brutos.map(c => {
+                    const o = { name: c.name, value: c.value, domain: c.domain, path: c.path || '/', secure: !!c.secure, httpOnly: !!c.httpOnly };
+                    if (c.sameSite) o.sameSite = c.sameSite;
+                    if (!c.session && c.expires > 0) o.expires = c.expires;
+                    return o;
+                });
+                const cdp = await page.createCDPSession();
+                await cdp.send('Network.setCookies', { cookies });
+                console.log(`🍪 ${cookies.length} cookies do IMVU carregados.`);
+            } else {
+                console.log('⚠️ cookies-imvu.json não encontrado: o bot vai abrir DESLOGADO. Rode exportar-cookies.js no PC.');
+            }
+        } catch (e) { console.log(`⚠️ cookies: ${ocultarSegredos(e)}`); }
+    }
 
     try {
         await page.goto(ROOM_URL, { waitUntil: 'domcontentloaded', timeout: 0 });
@@ -1456,6 +1492,13 @@ async function iniciarBot() {
         }
 
         // !testeia (só o criador): testa a IA e mostra qual modelo respondeu
+        // !limparchat (só o PrzY): limpa o chat antigo agora, para você testar
+        if (info.ehCriador && cmd === '!limparchat') {
+            const r = await limparChatAntigo();
+            await falar(r ? `🧹 Chat limpo: ${r.removidas} linha(s) antiga(s) removida(s), ficaram ${r.restantes}.` : '🧹 Não consegui limpar o chat agora (veja o terminal).');
+            return;
+        }
+
         if (info.ehCriador && cmd === '!testeia') {
             try {
                 const resposta = await chamarModeloIA('Responda apenas com uma frase curta de bom dia, no feminino.');
@@ -1768,10 +1811,39 @@ async function iniciarBot() {
         for (const [k, h] of historicoIA) if (h.t < limite) historicoIA.delete(k);
     }
 
+    // Apaga da página as linhas antigas do chat (só as que o bot já leu) e mantém as MANTER_LINHAS_CHAT mais recentes.
+    async function limparChatAntigo() {
+        try {
+            const r = await page.evaluate((vistosArr, manter) => {
+                const lidas = new Set(vistosArr);
+                const num = (s) => { const m = /(\d+)/.exec(s || ''); return m ? parseInt(m[1], 10) : 0; };
+                const linhas = [...document.querySelectorAll('.cs2-msg')];
+                const entradas = [...new Set(linhas.map(l => l.getAttribute('data-chat-entry') || '').filter(Boolean))];
+                if (entradas.length <= manter) return { removidas: 0, restantes: linhas.length, motivo: 'pouca coisa' };
+                entradas.sort((a, b) => num(b) - num(a)); // mais novas primeiro
+                if (num(entradas[0]) === 0) return { removidas: 0, restantes: linhas.length, motivo: 'numeração desconhecida' };
+                const ficam = new Set(entradas.slice(0, manter));
+                let removidas = 0;
+                for (const l of linhas) {
+                    const e = l.getAttribute('data-chat-entry') || '';
+                    if (!e || ficam.has(e) || !lidas.has(e)) continue; // nunca apaga o que ainda não foi lido
+                    try { l.remove(); removidas++; } catch (err) {}
+                }
+                return { removidas, restantes: document.querySelectorAll('.cs2-msg').length, motivo: '' };
+            }, [...vistos], MANTER_LINHAS_CHAT);
+            console.log(`🧹 Limpeza do chat: ${r.removidas} linha(s) antiga(s) removida(s), ficaram ${r.restantes}.${r.motivo ? ' (' + r.motivo + ')' : ''}`);
+            return r;
+        } catch (e) {
+            console.log(`⚠️ Limpeza do chat falhou: ${ocultarSegredos(e)}`);
+            return null;
+        }
+    }
+
     // ---------- LOOP PRINCIPAL ----------
     const vistos = new Set();
     let primeiraLeitura = true;
     let ciclo = 0;
+    let ultimaLimpezaChat = Date.now();
     let ciclosSemLinhas = 0;
     let avisouSemLinhas = false;
     let avisosSemAutor = 0;
@@ -1835,6 +1907,10 @@ async function iniciarBot() {
             if (primeiraLeitura && entradas.length > 0) {
                 primeiraLeitura = false;
                 console.log('🛡️ Monitoramento ativo! Pessoas na sala agora: ' + pessoasNaSala().size);
+            }
+            if (LIMPAR_CHAT_MS > 0 && !primeiraLeitura && Date.now() - ultimaLimpezaChat >= LIMPAR_CHAT_MS) {
+                ultimaLimpezaChat = Date.now();
+                await limparChatAntigo();
             }
             if (vistos.size > 5000) {
                 vistos.clear();
