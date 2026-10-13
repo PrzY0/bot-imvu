@@ -1,0 +1,27 @@
+name: Executar Bot IMVU
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */6 * * *'
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Baixar o código do repositório
+        uses: actions/checkout@v3
+
+      - name: Configurar ambiente Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+
+      - name: Instalar dependências (Puppeteer)
+        run: |
+          npm install
+
+      - name: Iniciar o Bot IMVU
+        run: |
+          node src/index.js
